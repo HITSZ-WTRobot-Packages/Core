@@ -10,6 +10,12 @@ namespace core::controller
 class ControllerNode
 {
 public:
+    virtual ~ControllerNode() { assert(state_ == State::Disabled); }
+    ControllerNode(const ControllerNode&)            = delete;
+    ControllerNode& operator=(const ControllerNode&) = delete;
+    ControllerNode(ControllerNode&&)                 = delete;
+    ControllerNode& operator=(ControllerNode&&)      = delete;
+
     enum class State
     {
         /// 自身未使能
@@ -98,11 +104,6 @@ protected:
     // 状态和关系必须由 IController 处理；上层只能继承 IController。
 private:
     ControllerNode() = default;
-    virtual ~ControllerNode() { assert(state_ == State::Disabled); }
-    ControllerNode(const ControllerNode&)            = delete;
-    ControllerNode& operator=(const ControllerNode&) = delete;
-    ControllerNode(ControllerNode&&)                 = delete;
-    ControllerNode& operator=(ControllerNode&&)      = delete;
 
     // 状态和关系必须由 IController 处理
     State state_{ State::Disabled };
@@ -153,9 +154,11 @@ private:
         state_ = State::Protected;
     }
 
-    virtual std::size_t childCount() const { return 0; }
+    virtual void rollbackEnable() = 0;
 
-    virtual ControllerNode* childAt(std::size_t) const { return nullptr; }
+    [[nodiscard]] virtual std::size_t childCount() const { return 0; }
+
+    [[nodiscard]] virtual ControllerNode* childAt(std::size_t) const { return nullptr; }
 
     template <std::size_t> friend class IController;
 };
@@ -183,13 +186,15 @@ public:
      * 为保证 controller 类的使能及其传递关系不被破坏，该函数不支持覆写
      * @return 是否使能成功
      */
-    virtual bool enable() final
+    bool enable() final
     {
         // 非 Disabled 即已经使能，本函数允许重复使能
-        if (this->state_ != State::Disabled)
+        if (enabled())
+        {
+            old_enabled_ = true;
             return true;
-
-        std::array<bool, N> child_enabled_map{};
+        }
+        old_enabled_ = false;
 
         /**
          * 如果失败，则必然需要释放前面已经成功获取到控制权的节点
@@ -199,13 +204,11 @@ public:
          */
         auto rollback = [&](const int i)
         {
-            for (int j = i - 1; j >= 0; --j)
+            for (int j = i; j >= 0; --j)
             {
                 auto* previous = children_[j];
                 previous->releaseController(this);
-                if (!child_enabled_map[j])
-                    // 如果之前节点未使能，重新失能它
-                    previous->disable();
+                previous->rollbackEnable();
             }
         };
 
@@ -213,7 +216,6 @@ public:
         {
             auto* child = children_[i];
 
-            child_enabled_map[i] = child->enabled();
             // 尝试使能并获取控制权
             if (!child->enable() || !child->acquireController(this))
             {
@@ -239,7 +241,7 @@ public:
         return true;
     }
 
-    virtual void disable() final
+    void disable() final
     {
         // 改变自身状态为失能态
         selfDisable();
@@ -257,11 +259,25 @@ public:
     }
 
 protected:
-    std::size_t     childCount() const final { return N; }
-    ControllerNode* childAt(std::size_t i) const final { return children_[i]; }
+    [[nodiscard]] std::size_t     childCount() const final { return N; }
+    [[nodiscard]] ControllerNode* childAt(std::size_t i) const final { return children_[i]; }
 
 private:
     std::array<ControllerNode*, N> children_{};
+
+    bool old_enabled_{ false };
+
+    void rollbackEnable() final
+    {
+        if (!old_enabled_)
+        {
+            for (auto& child : children_)
+                child->rollbackEnable();
+
+            selfDisable();
+            state_ = State::Disabled;
+        }
+    }
 };
 
 } // namespace core::controller
