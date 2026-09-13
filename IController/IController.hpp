@@ -7,42 +7,95 @@
 namespace core::controller
 {
 
-enum class State
-{
-    Disabled,
-    Protected,
-    Running
-};
-
 class ControllerNode
 {
 public:
+    enum class State
+    {
+        /// 自身未使能
+        Disabled,
+        /// 已使能但不接受直接控制命令
+        Protected,
+        /// 独立运行态
+        Standalone,
+        /// 受控运行态
+        Controlled,
+    };
+
+    // ControllerNode 只定义节点接口；状态和父子控制关系由 IController 维护。
     virtual bool enable() = 0;
 
     virtual void disable() = 0;
 
-    [[nodiscard]] State state() const { return state_; }
-    [[nodiscard]] bool  enabled() const { return state_ != State::Disabled; }
+    virtual bool standalone() final
+    {
+        if (state_ == State::Standalone)
+            return true;
+        if (state_ == State::Protected)
+        {
+            state_ = State::Standalone;
+            return true;
+        }
+        return false;
+    }
 
+    virtual bool protect() final
+    {
+        if (state_ == State::Protected)
+            return true;
+        // 失能状态下需要先使能；受控态不能自己切换状态
+        if (state_ == State::Disabled || state_ == State::Controlled)
+            return false;
+        selfProtect();
+        state_ = State::Protected;
+        return true;
+    }
+
+    /**
+     * @return 当前节点状态
+     */
+    [[nodiscard]] State state() const { return state_; }
+
+    /** @return 节点是否处于非 Disabled 状态。 */
+    [[nodiscard]] bool enabled() const { return state_ != State::Disabled; }
+
+    [[nodiscard]] bool isStandalone() const { return state_ == State::Standalone; }
+
+    [[nodiscard]] bool isProtected() const { return state_ == State::Protected; }
+
+    [[nodiscard]] bool isControlled() const { return state_ == State::Controlled; }
+
+    /** @return 当前持有本节点控制权的父控制器；没有控制器时返回 nullptr。 */
     [[nodiscard]] ControllerNode* currentController() const { return parent_; }
 
 protected:
     /**
-     * 进入 protect 状态
+     * 使节点进入硬件保护状态。
+     *
+     * 该函数只执行节点自身的保护动作不负责修改 state_，也不负责传递控制关系。
      */
-    virtual void protect() = 0;
+    virtual void selfProtect() = 0;
 
     /**
-     * 节点的自身使能，该函数定义 *自身* 使能过程中的动作，请勿在本函数传递使能关系
+     * 节点的自身使能动作。
+     *
+     * 该函数只处理本节点硬件或本节点内部资源，禁止在这里调用 child 的
+     * enable() 或 acquireController()；
+     * 父子使能关系统一由 IController::enable()
+     * 传递。返回 false 时，节点自身不得留下未清理的部分使能状态。
+     *
      * @return 是否使能成功
      */
     virtual bool selfEnable() { return true; }
 
     /**
-     * 节点自身失能，该函数定义 *自身* 失能过程中的动作，请勿在本函数传递失能关系
+     * 节点自身失能动作。
+     *
+     * 该函数只处理本节点硬件或本节点内部资源，禁止在这里传递父子失能关系。
      */
     virtual void selfDisable() {}
 
+    // 状态和关系必须由 IController 处理；上层只能继承 IController。
 private:
     ControllerNode() = default;
     virtual ~ControllerNode() { assert(state_ == State::Disabled); }
@@ -56,12 +109,12 @@ private:
 
     ControllerNode* parent_{ nullptr };
 
-    void enterProtectedState()
-    {
-        protect();
-        state_ = State::Protected;
-    }
-
+    /**
+     * 获取本节点控制权，仅供 IController::enable() 调用。
+     *
+     * 同一个 controller 可以重复获取；已被其他 controller 持有时失败。
+     * 节点必须先处于 enabled 状态才能被获取控制权。
+     */
     virtual bool acquireController(ControllerNode* controller)
     {
         if (controller == nullptr || !enabled())
@@ -74,17 +127,30 @@ private:
             return false;
         parent_ = controller;
 
-        enterProtectedState();
+        // 进入受控运行态
+        selfProtect();
+        state_ = State::Controlled;
         return true;
     }
 
+    /**
+     * 释放本节点控制权，仅释放指定 controller 持有的控制权。
+     *
+     * 释放后节点仍保持 enabled，并重新执行保护动作；真正的失能由 disable()
+     * 负责。
+     */
     virtual void releaseController(ControllerNode* controller)
     {
+        if (state_ != State::Controlled)
+            return;
         if (parent_ != controller)
             // 本身没有控制权，当然是释放了
             return;
         parent_ = nullptr;
-        enterProtectedState();
+
+        // 保护自身，并进入保护态
+        selfProtect();
+        state_ = State::Protected;
     }
 
     virtual std::size_t childCount() const { return 0; }
@@ -167,7 +233,9 @@ public:
             return false;
         }
 
-        enterProtectedState();
+        // 使能之后立即进入保护状态
+        state_ = State::Protected;
+        selfProtect();
         return true;
     }
 
@@ -184,6 +252,8 @@ public:
         // 向上传递失能
         if (parent_ != nullptr)
             parent_->disable();
+
+        parent_ = nullptr;
     }
 
 protected:
