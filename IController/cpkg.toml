@@ -2,4 +2,4 @@ format_version = 1
 name = "IController"
 pkgname = "Core::IController"
 version = "0.1.0"
-dependencies = []
+dependencies = ["libs::Concurrency"]
