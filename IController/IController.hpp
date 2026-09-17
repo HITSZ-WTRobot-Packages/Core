@@ -20,19 +20,23 @@ namespace core::control
  * - Standalone 已使能、无控制者的直接控制态；
  * - Controlled 控制权已被 parent_ 指向的控制器取得。
  *
- * parent_ 非空当且仅当本节点为 Controlled；失能的节点不再持有子节点。
+ * parent_ 非空当且仅当本节点为 Controlled；除正在推进的使能事务之外，失能的节点不持有
+ * 子节点（事务中父节点先取得子节点的控制权，最后才提交自身）。
  *
  * 并发模型（单核，任务与 ISR 之间可相互抢占）：
  * 每个节点持有一把三态节点锁 Idle / Enabling / Cancelled，它同时承担“本轮使能是否持有
  * 本节点”和“本节点是否已被失能取消”两个含义：
- * - enable() 先按“自身优先”的顺序锁住整个候选子树（lockTree），再自上而下推进，收尾时
- *   统一释放并检查本轮是否被取消（unlockTree）；只有整棵树都没被取消，本轮才算成功。
+ * - enable() 先按“自身优先”的顺序锁住整个候选子树（lockTree），再自上而下推进；收尾时在
+ *   仍持有这些节点锁的情况下检查本轮是否被取消并回滚（cancelledTree()），最后统一释放
+ *   （unlockTree()）。只有整棵树都没被取消，本轮才算成功；因此取消检查和回滚都不会碰到
+ *   其他上下文刚在同一棵树上完成的生命周期操作。
  * - disable() 优先级更高：它先取消本节点（以及控制链上各节点）在途的使能标记，再执行
  *   失能。被取消的在途使能不会提交成功，其已提交的部分由该事务自身的回滚撤销，而失能
  *   产生的状态保持有效：被失能的节点保持 Disabled，借用的既有使能节点只失去本轮获得的
  *   控制权。
- * - 失能只对“尚未取得节点锁”的使能让步：节点锁取得之前的失能按先后顺序先于本轮使能，
- *   节点锁取得之后的失能则取消本轮使能。
+ * - 失能只对“尚未取得节点锁”的使能让步：节点锁取得之前的失能按先后顺序先于本轮使能；
+ *   取得之后、本轮取消检查（cancelledTree()）之前的失能取消本轮使能；取消检查之后的失能
+ *   （包括 unlockTree() 释放节点锁期间的失能）按排在本轮之后处理。
  *
  * 抢占点保证的是最终状态一致，不是 selfEnable() 内部没有重新打开硬件的窗口：取消检查
  * 位于每个节点的推进、自身使能之后与状态提交之前，取消发生后本节点不再提交状态，其自身
@@ -114,10 +118,9 @@ private:
     /**
      * 使能本节点并让 controller 取得其控制权，由 enable() 与父节点驱动。
      *
-     * 已经由同一 controller 持有的节点幂等成功（同一轮内的共享候选节点）；已使能但不是
-     * Standalone 的节点只被借用一次，不重建其子树；本轮内新使能的节点先推进候选子节点，
-     * 再执行自身使能、保护与状态提交。任一时刻发现本节点已被失能取消，立即失败并由调用者
-     * 回滚。
+     * 已经使能、但不是 Standalone 也没有其他控制者的节点只被借用一次，不重建其子树；
+     * 本轮内新使能的节点先推进候选子节点，再执行自身使能、保护与状态提交。任一时刻发现
+     * 本节点已被失能取消，立即失败并由调用者回滚。
      */
     virtual bool enableAndAcquireController(ControllerNode* controller) noexcept = 0;
 
@@ -132,8 +135,11 @@ private:
     /// 以本节点优先的顺序锁住候选子树；失败时释放已锁住的部分。
     virtual bool lockTree() noexcept = 0;
 
-    /// 释放本节点及其候选子树的锁；返回本轮的所有节点是否都没有被取消。
-    virtual bool unlockTree() noexcept = 0;
+    /// 检查本轮锁定的候选子树上是否有节点已被失能取消；不改变任何节点锁。
+    [[nodiscard]] virtual bool cancelledTree() const noexcept = 0;
+
+    /// 释放本节点及其候选子树的节点锁。
+    virtual void unlockTree() noexcept = 0;
 
     /// 关闭本节点及其活动子树（活动子节点全部失能，控制关系解除）。
     virtual void idleTree() noexcept = 0;
@@ -189,14 +195,19 @@ public:
         if (!lockTree())
             return false;
 
-        const bool enabled     = enableAndAcquireController(nullptr);
-        const bool uncancelled = unlockTree();
+        const bool enabled = enableAndAcquireController(nullptr);
 
-        // 本轮使能成功地提交了状态，但中途有节点被失能：整轮回滚
-        if (enabled && !uncancelled)
+        // 取消检查与回滚都必须在“本轮仍持有节点锁”的区间内完成：该区间内其他上下文无法
+        // 取得本树的任何节点，因此回滚只会作用于本轮自己的改动。取消检查之后到达的失能
+        // （含 unlockTree() 释放期间的失能）按排在本轮之后处理：它失能成功的节点保持
+        // Disabled，但本轮可能已经报成功。
+        const bool cancelled = enabled && cancelledTree();
+        if (cancelled)
             rollbackLastEnablement();
 
-        return enabled && uncancelled;
+        unlockTree();
+
+        return enabled && !cancelled;
     }
 
     bool disableTree() noexcept { return disable(true); }
@@ -228,7 +239,7 @@ public:
         }
 
         if (held)
-            enable_state_.idle();
+            enable_state_.unlock();
 
         // 控制链上的节点只是为了控制本节点才被使能，随本节点一同失能
         if (up != nullptr)
@@ -249,31 +260,27 @@ public:
     {
         if (!isStandalone())
             return false;
-        state_ = State::Protected;
         selfProtect();
+        state_ = State::Protected;
         return true;
     }
 
 private:
     bool acquireControllerWithoutCheckingState(ControllerNode* controller) noexcept
     {
-        if (parent_ == nullptr)
-        {
-            parent_ = controller;
-            return true;
-        }
-        return parent_ == controller;
+        // 只接受无主的节点；已被其他控制器持有（或已被本轮持有）都视为冲突
+        if (parent_ != nullptr)
+            return false;
+
+        parent_ = controller;
+        return true;
     }
 
     bool enableAndAcquireController(ControllerNode* controller) noexcept final
     {
         // 本节点在途的使能已被失能取消：立即失败，不再推进
-        if (enable_state_.state_.load() != EnableState::State::Enabling)
+        if (enable_state_.state_.load(std::memory_order_acquire) != EnableState::State::Enabling)
             return false;
-
-        // 同一轮内再次到达（共享候选节点）：控制关系已经建立，幂等成功
-        if (state_ == State::Controlled && parent_ == controller)
-            return true;
 
         if (isEnabled())
         {
@@ -287,7 +294,7 @@ private:
                 return false;
 
             // 收权过程中被失能：失能优先，放弃本次借用
-            if (enable_state_.state_.load() != EnableState::State::Enabling)
+            if (enable_state_.state_.load(std::memory_order_acquire) != EnableState::State::Enabling)
             {
                 parent_ = nullptr;
                 state_  = State::Disabled;
@@ -303,7 +310,7 @@ private:
         // 先向下传递使能关系
         for (std::size_t i = 0; i < N; ++i)
         {
-            if (enable_state_.state_.load() != EnableState::State::Enabling ||
+            if (enable_state_.state_.load(std::memory_order_acquire) != EnableState::State::Enabling ||
                 !children_[i]->enableAndAcquireController(this))
             {
                 // 回滚本轮已经使能成功的子节点
@@ -321,7 +328,7 @@ private:
         }
 
         // 自身使能之后才被失能：收回本次自身使能，保持 Disabled
-        if (enable_state_.state_.load() != EnableState::State::Enabling)
+        if (enable_state_.state_.load(std::memory_order_acquire) != EnableState::State::Enabling)
         {
             selfDisable();
             for (std::size_t j = N; j-- > 0;)
@@ -377,20 +384,29 @@ private:
             {
                 for (std::size_t j = i; j-- > 0;)
                     children_[j]->unlockTree();
-                (void)enable_state_.unlock();
+                enable_state_.unlock();
                 return false;
             }
         }
         return true;
     }
 
-    bool unlockTree() noexcept final
+    [[nodiscard]] bool cancelledTree() const noexcept final
     {
-        bool uncancelled = enable_state_.unlock();
+        if (enable_state_.state_.load(std::memory_order_acquire) == EnableState::State::Cancelled)
+            return true;
+
         for (std::size_t i = 0; i < N; ++i)
-            if (!children_[i]->unlockTree())
-                uncancelled = false;
-        return uncancelled;
+            if (children_[i]->cancelledTree())
+                return true;
+        return false;
+    }
+
+    void unlockTree() noexcept final
+    {
+        enable_state_.unlock();
+        for (std::size_t i = 0; i < N; ++i)
+            children_[i]->unlockTree();
     }
 
     void idleTree() noexcept final
@@ -407,7 +423,7 @@ private:
                 children_[i]->idleTree();
 
         if (held)
-            enable_state_.idle();
+            enable_state_.unlock();
     }
 
     void releaseController(ControllerNode* controller) noexcept final
@@ -451,13 +467,10 @@ private:
                                                   std::memory_order_relaxed);
         }
 
-        /// 使能事务释放本节点；返回本节点在本轮中是否没有被取消。
-        [[nodiscard]] bool unlock() noexcept
-        {
-            return state_.exchange(State::Idle, std::memory_order_acq_rel) == State::Enabling;
-        }
+        /// 释放本节点：使能事务收尾，或失能释放自己持有的临时标记。
+        void unlock() noexcept { state_.store(State::Idle, std::memory_order_release); }
 
-        /// 取消在途的使能；返回本次调用是否取得了本节点（取得者需要自行 idle() 释放）。
+        /// 取消在途的使能；返回本次调用是否取得了本节点（取得者需要自行 unlock() 释放）。
         [[nodiscard]] bool cancel() noexcept
         {
             State expected = State::Enabling;
@@ -473,9 +486,6 @@ private:
                                                   std::memory_order_acq_rel,
                                                   std::memory_order_relaxed);
         }
-
-        /// 释放由本次失能持有的节点。
-        void idle() noexcept { state_.store(State::Idle, std::memory_order_release); }
     } enable_state_;
 
     /// 本轮使能开始时本节点是否已经使能；只对本轮访问过的节点有效。
