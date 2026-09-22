@@ -25,11 +25,10 @@ namespace core::control
  * 子节点（事务中父节点先取得子节点的控制权，最后才提交自身）。
  *
  * 并发模型（单核，任务与 ISR 之间可相互抢占）：
- * 每个节点持有一把四态节点锁 Idle / Enabling / Held / Disabling：
+ * 每个节点持有一把三态节点锁 Idle / Active / Disabling：
  * - Idle       空闲，任何上下文都可以取得本节点；
- * - Enabling   某一轮使能持有本节点：推进期间（lockTree() 到 unlockTree()）整棵候选子树保持
- *              该标记；
- * - Held       某个状态转移（standalone()/protect()）持有本节点；
+ * - Active     使能轮或状态转移（standalone()/protect()）持有本节点；使能轮推进期间
+ *              （lockTree() 到 unlockTree()）整棵候选子树保持该标记；
  * - Disabling  失能正在接管本节点：失能体取得空闲节点后以该标记持有它，直到失能动作与状态
  *              提交结束；持有者若是使能轮或状态转移，必须在提交状态前观察到该标记、放弃提交
  *              并自行释放本节点锁。
@@ -109,10 +108,7 @@ public:
      */
     [[nodiscard]] virtual bool protect() noexcept = 0;
 
-    [[nodiscard]] State state() const noexcept
-    {
-        return state_.load(std::memory_order_relaxed);
-    }
+    [[nodiscard]] State state() const noexcept { return state_.load(std::memory_order_relaxed); }
 
     [[nodiscard]] bool isEnabled() const noexcept { return state() != State::Disabled; }
     [[nodiscard]] bool isStandalone() const noexcept { return state() == State::Standalone; }
@@ -210,24 +206,30 @@ public:
 
     [[nodiscard]] bool enable() noexcept final
     {
+        // 基于自身状态判定，原子的
         if (isEnabled())
             return true;
 
+        // 尝试向下锁定树，注意，锁定树只保证不会有另一个使能请求同时进行
         if (!lockTree())
             return false;
 
+        // 向下使能并获取控制权，这是一个非原子操作
         const bool enabled = enableAndAcquireController(nullptr);
 
-        // 取消检查与回滚都必须在“本轮仍持有节点锁”的区间内完成：该区间内其他上下文无法
-        // 取得本树的任何节点，因此回滚只会作用于本轮自己的改动。取消检查之后到达的失能
-        // （含 unlockTree() 释放期间的失能）按排在本轮之后处理：它失能成功的节点保持
-        // Disabled，但本轮可能已经报成功。
+        // 上面的使能过程一定没有被使能或者 protect/standalone 打断，但是期间可能产生了 disable
+        // 此时 enable 成功但是中途产生了 disable，即使能被取消，需要 rollback
         const bool cancelled = enabled && disablingTree();
+
+        // 如果使能并没有成功，需要回滚使能操作.
+        // 该操作非原子，但是在 rollback 的过程中*不会*导致错误的使能
         if (cancelled)
             rollbackLastEnablement();
 
+        // 解锁 tree
         unlockTree();
 
+        // 使能成功并且没有取消，即最终使能成功
         return enabled && !cancelled;
     }
 
@@ -239,32 +241,43 @@ public:
         if (reverse && isControlled())
             return false;
 
-        // 取消本节点在途的使能或状态转移；本节点空闲时由本次失能临时持有，直到状态提交完成
+        // 将本节点状态置为 cancelled
+        // 可以阻止新的 enable 进入本节点；同时标记本节点使能取消
         const bool held = enable_state_.cancel();
 
+        // 先向上确保控制权断开
         ControllerNode* const up = parent_;
         parent_                  = nullptr;
+
+        // 失能自身，并切换状态为失能
         selfDisable();
         state_.store(State::Disabled, std::memory_order_relaxed);
 
         if (reverse)
         {
+            // 需要向下传递失能
             for (std::size_t i = 0; i < N; ++i)
                 if (children_[i]->parent_ == this)
                     children_[i]->idleTree();
         }
         else
         {
+            // 仅需向下释放控制权
             for (std::size_t i = 0; i < N; ++i)
                 children_[i]->releaseController(this);
         }
 
-        if (held)
-            enable_state_.unlock();
-
-        // 控制链上的节点只是为了控制本节点才被使能，随本节点一同失能
+        // 先向上传递失能，再释放锁，可以保证
+        // 1. 任何使能链进来都会被本节点阻止
+        // 2. 本节点打断使能链能成功被识别为 cancelled
         if (up != nullptr)
             (void)up->disable(false);
+
+        // 如果 disable 之前是 idle，则恢复 idle，
+        // 否则之前被另外的 使能/protect/standalone 持有，由它们自己回滚状态后释放
+        // 或者被其他 disable 持有，由 disable 自己释放
+        if (held)
+            enable_state_.finishDisable();
 
         return true;
     }
@@ -273,7 +286,7 @@ public:
     {
         // 状态转移同样是节点范围内的生命周期变更：必须持有节点锁，才能与在途的使能轮、
         // 失能体互斥。取不到锁表示存在竞争，调用者可以稍后重试。
-        if (!enable_state_.tryHold())
+        if (!enable_state_.lock())
             return false;
 
         bool result = false;
@@ -284,19 +297,19 @@ public:
         else if (isProtected())
         {
             // 提交前用 CAS 复检：失能可能在取得节点锁之后接管本节点，此时不再提交
-            State expected = State::Protected;
-            result = state_.compare_exchange_strong(expected,
+            auto expected = State::Protected;
+            result        = state_.compare_exchange_strong(expected,
                                                     State::Standalone,
                                                     std::memory_order_relaxed);
         }
 
-        enable_state_.unlock();
-        return result;
+        // 通过 bool unlock() 判断是否被 disable 打断
+        return result && enable_state_.unlock();
     }
 
     [[nodiscard]] bool protect() noexcept final
     {
-        if (!enable_state_.tryHold())
+        if (!enable_state_.lock())
             return false;
 
         bool result = false;
@@ -305,16 +318,15 @@ public:
             // 先提交自身保护行为，再改变状态；钩子期间可能被失能接管，因此写状态用 CAS 复检
             selfProtect();
 
-            State expected = State::Standalone;
-            result         = state_.compare_exchange_strong(expected,
-                                                            State::Protected,
-                                                            std::memory_order_relaxed);
+            auto expected = State::Standalone;
+            result        = state_.compare_exchange_strong(expected,
+                                                    State::Protected,
+                                                    std::memory_order_relaxed);
             if (!result && state() == State::Disabled)
                 selfDisable(); // 失能先落地：撤销刚提交的保护行为
         }
 
-        enable_state_.unlock();
-        return result;
+        return result && enable_state_.unlock();
     }
 
 private:
@@ -331,7 +343,7 @@ private:
     bool enableAndAcquireController(ControllerNode* controller) noexcept final
     {
         // 本节点在途的使能已被失能取消：立即失败，不再推进
-        if (!enable_state_.holdsRound())
+        if (!enable_state_.isActive())
             return false;
 
         if (isEnabled())
@@ -348,7 +360,7 @@ private:
                 return false;
 
             // 收权过程中被失能：失能优先，放弃本次借用
-            if (!enable_state_.holdsRound())
+            if (!enable_state_.isActive())
             {
                 parent_ = nullptr;
                 state_.store(State::Disabled, std::memory_order_relaxed);
@@ -364,7 +376,7 @@ private:
         // 先向下传递使能关系
         for (std::size_t i = 0; i < N; ++i)
         {
-            if (!enable_state_.holdsRound() || !children_[i]->enableAndAcquireController(this))
+            if (!enable_state_.isActive() || !children_[i]->enableAndAcquireController(this))
             {
                 // 回滚本轮已经使能成功的子节点
                 for (std::size_t j = i; j-- > 0;)
@@ -381,7 +393,7 @@ private:
         }
 
         // 自身使能之后才被失能：收回本次自身使能，保持 Disabled
-        if (!enable_state_.holdsRound())
+        if (!enable_state_.isActive())
         {
             selfDisable();
             for (std::size_t j = N; j-- > 0;)
@@ -488,17 +500,20 @@ private:
 
     void idleTree() noexcept final
     {
-        // 调用者已经确认本节点是活动子节点
+        // 向下失能整颗树，首先取消可能存在的使能请求
         const bool held = enable_state_.cancel();
 
+        // 向上断开控制权，并失能自身
         parent_ = nullptr;
         selfDisable();
         state_.store(State::Disabled, std::memory_order_relaxed);
 
+        // 向下递归失能
         for (std::size_t i = 0; i < N; ++i)
             if (children_[i]->parent_ == this)
                 children_[i]->idleTree();
 
+        // 如果在失能之前没有在使能或者转换状态，释放为 idle
         if (held)
             enable_state_.unlock();
     }
@@ -512,7 +527,7 @@ private:
         parent_ = nullptr;
 
         // 只释放这条控制边：并发失能可能已经接管本节点，此时 CAS 失败，保持失能结果
-        State expected = State::Controlled;
+        auto expected = State::Controlled;
         if (state_.compare_exchange_strong(expected, State::Protected, std::memory_order_relaxed))
             return;
 
@@ -525,8 +540,8 @@ private:
     /**
      * 节点锁：由使能事务与节点范围内的生命周期变更共同使用。
      *
-     * Idle -> Enabling 表示某一轮使能持有本节点；Idle -> Held 表示某个状态转移
-     * （standalone()/protect()）持有本节点；Idle -> Disabling 表示失能体取得并临时持有本节点。
+     * Idle -> Active 表示使能轮或状态转移（standalone()/protect()）持有本节点；
+     * Idle -> Disabling 表示失能体取得并临时持有本节点。
      * 持有点被置为 Disabling 表示“失能正在接管本节点，持有者必须在提交状态前观察到它、
      * 放弃提交并自行释放本节点”。重复取消是幂等的。
      */
@@ -536,35 +551,25 @@ private:
         enum class State
         {
             Idle,
-            Enabling,
-            Held,
+            Active,
             Disabling,
         };
 
-        /// 使能事务取得本节点；失败表示本节点已被其他事务或变更持有。
+        /// 取得本节点；失败表示本节点已被其他事务或变更持有。
         [[nodiscard]] bool lock() noexcept
         {
+            // lock 必须从 Idle 变更过来
             State expected = State::Idle;
             return state_.compare_exchange_strong(expected,
-                                                  State::Enabling,
-                                                  std::memory_order_acquire,
-                                                  std::memory_order_relaxed);
-        }
-
-        /// 非事务的生命周期变更取得本节点；失败表示存在竞争，调用者可以稍后重试。
-        [[nodiscard]] bool tryHold() noexcept
-        {
-            State expected = State::Idle;
-            return state_.compare_exchange_strong(expected,
-                                                  State::Held,
+                                                  State::Active,
                                                   std::memory_order_acquire,
                                                   std::memory_order_relaxed);
         }
 
         /// 本节点上的使能轮是否仍持有它；被取消后为 false，本轮据此放弃提交。
-        [[nodiscard]] bool holdsRound() const noexcept
+        [[nodiscard]] bool isActive() const noexcept
         {
-            return state_.load(std::memory_order_acquire) == State::Enabling;
+            return state_.load(std::memory_order_acquire) == State::Active;
         }
 
         /// 本节点是否正在被失能接管；持有者据此放弃提交。
@@ -573,8 +578,18 @@ private:
             return state_.load(std::memory_order_relaxed) == State::Disabling;
         }
 
-        /// 释放本节点：使能事务收尾，或持有者完成变更。
-        void unlock() noexcept { state_.store(State::Idle, std::memory_order_release); }
+        /// 释放本节点
+        void finishDisable() noexcept { state_.store(State::Idle, std::memory_order_release); }
+
+        bool unlock() noexcept
+        {
+            // lock 必须从 Active 变更过来
+            State expected = State::Active;
+            return state_.compare_exchange_strong(expected,
+                                                  State::Idle,
+                                                  std::memory_order_acquire,
+                                                  std::memory_order_relaxed);
+        }
 
         /**
          * 请求失能接管本节点在途的使能或状态转移。
