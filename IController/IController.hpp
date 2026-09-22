@@ -28,31 +28,31 @@ namespace core::control
  * 每个节点持有一把三态节点锁 Idle / Active / Disabling：
  * - Idle       空闲，任何上下文都可以取得本节点；
  * - Active     使能轮或状态转移（standalone()/protect()）持有本节点；使能轮推进期间
- *              （lockTree() 到 unlockTree()）整棵候选子树保持该标记；
- * - Disabling  失能正在接管本节点：失能体取得空闲节点后以该标记持有它，直到失能动作与状态
- *              提交结束；持有者若是使能轮或状态转移，必须在提交状态前观察到该标记、放弃提交
- *              并自行释放本节点锁。
+ *              （lockTree() 到 unlockEnableTree()）整棵候选子树保持该标记；
+ * - Disabling  失能正在接管本节点：若节点原为空闲，失能体取得取消声明并在自身动作完成后释放；若
+ *              节点原由使能轮或状态转移持有，失能体只发出取消，持有者必须在提交前观察到该标记，
+ *              回滚后再将标记恢复为 Idle。
  *
  * - enable() 先按“自身优先”的顺序锁住整个候选子树（lockTree），再自上而下推进；收尾时在
- *   仍持有这些节点锁的情况下检查本轮是否被取消并回滚（disablingTree()），最后统一释放
- *   （unlockTree()）。只有整棵树都没被取消，本轮才算成功；因此取消检查和回滚都不会碰到
+ *   仍持有这些节点锁的情况下检查本轮是否被取消并回滚（disablingTree），最后通过
+ *   unlockEnableTree() 释放。只有整棵树都没被取消，本轮才算成功；因此取消检查和回滚都不会碰到
  *   其他上下文刚在同一棵树上完成的生命周期操作。
  * - disable() 优先级更高：它先取消本节点（以及控制链上各节点）在途的使能或状态转移，再
- *   执行失能。cancel() 的后置条件是“取消只会发出，不会丢失”：返回 true 表示本节点原为空闲、
- *   已由本次调用临时持有（由调用者释放）；返回 false 表示持有者已被置为 Disabling，它会在
- *   提交状态前观察到取消并自行释放。被取消的在途使能不会提交成功，其已提交的部分由该事务
- *   自身的回滚撤销：本轮新使能的节点被关闭，本轮借用的既有使能节点同样保持失能。失能产生的
- *   状态保持有效：被失能的节点保持 Disabled。
+ *   执行失能。cancel() 返回 true 表示本节点原为空闲，本次失能负责在动作完成后释放标记；返回
+ *   false 表示已有使能轮、状态转移或其他失能体持有/接管标记，由实际持有者在回滚或失能完成后
+ *   释放。被取消的在途使能不会提交成功，其已提交的部分由该事务自身的回滚撤销：本轮新使能的
+ *   节点被关闭，本轮借用的既有使能节点同样保持失能。失能产生的状态保持有效：被失能的节点保持
+ *   Disabled。
  * - 失能只对“尚未取得节点锁”的使能让步：节点锁取得之前的失能按先后顺序先于本轮使能；
- *   取得之后、本轮取消检查（disablingTree()）之前的失能取消本轮使能；取消检查之后的失能
- *   （包括 unlockTree() 释放节点锁期间的失能）按排在本轮之后处理。
+ *   取得之后、unlockEnableTree() 完成释放之前的失能都会被持有者观察并回滚；标记恢复为 Idle
+ *   之后到达的失能才按排在本轮之后处理。
  *
  * 抢占点保证的是最终状态一致，不是 selfEnable() 内部没有重新打开硬件的窗口：取消检查
  * 位于每个节点的推进、自身使能之后与状态提交之前，取消发生后本节点不再提交状态，其自身
  * 硬件由该检查或外层回滚关闭。
  *
  * 状态写入的所有权规则：持有本节点锁的上下文可以直接写 state_；不持有本节点锁、却可能与
- * 失能或控制权释放竞争的写入（回滚释放控制权、releaseController()、standalone()/protect()
+ * 失能或控制权释放竞争的写入（回滚释放控制权、releaseController、standalone()/protect()
  * 的提交）必须用 CAS 复检期望值：CAS 失败表示失能已经接管该节点，此时不再提交，保持失能
  * 结果。
  *
@@ -79,8 +79,9 @@ public:
     /**
      * 使能当前节点及其候选子树。
      *
-     * 已使能时幂等返回 true，不遍历子树。返回 false 表示本轮失败（自身或后代使能失败、
-     * 控制权冲突、候选节点处于 Standalone）或存在竞争，本轮的改动已被回滚。
+     * 已使能时先取得自身节点锁；若未被失能接管则幂等返回 true，不遍历子树。返回 false 表示
+     * 本轮失败（自身或后代使能失败、控制权冲突、候选节点处于 Standalone）或存在竞争，本轮的
+     * 改动已被回滚。
      */
     [[nodiscard]] virtual bool enable() noexcept = 0;
 
@@ -145,7 +146,8 @@ private:
      * 回滚本轮使能对本节点状态与控制权的改动。
      *
      * 本轮新使能的节点关闭自身并向下回滚；本轮借用的既有使能节点只释放本轮获得的控制权，
-     * 回到 Protected 并保留其原有子树；已被失能取消的节点保持 Disabled。
+     * 回到 Protected 并保留其原有子树；已被失能取消的节点保持 Disabled。回滚可重复执行，
+     * 也可被 disable 抢占：所有路径都收敛到失能结果，不重新建立控制边。
      */
     virtual void rollbackLastEnablement() noexcept = 0;
 
@@ -157,6 +159,8 @@ private:
 
     /// 释放本节点及其候选子树的节点锁。
     virtual void unlockTree() noexcept = 0;
+    /// 释放使能事务节点锁；发现取消时先回滚本轮，再释放取消标记。
+    virtual void unlockEnableTree() noexcept = 0;
 
     /// 关闭本节点及其活动子树（活动子节点全部失能，控制关系解除）。
     virtual void idleTree() noexcept = 0;
@@ -206,9 +210,22 @@ public:
 
     [[nodiscard]] bool enable() noexcept final
     {
-        // 基于自身状态判定，原子的
+        // 已使能节点的幂等路径也必须取得自身锁，避免与 disable 的状态提交交错。
         if (isEnabled())
-            return true;
+        {
+            if (!enable_state_.lock())
+                return false;
+            if (isEnabled())
+            {
+                if (enable_state_.unlock())
+                    return true;
+                enable_state_.finishDisable();
+                return false;
+            }
+            if (!enable_state_.unlock())
+                enable_state_.finishDisable();
+            return false;
+        }
 
         // 尝试向下锁定树，注意，锁定树只保证不会有另一个使能请求同时进行
         if (!lockTree())
@@ -226,8 +243,8 @@ public:
         if (cancelled)
             rollbackLastEnablement();
 
-        // 解锁 tree
-        unlockTree();
+        // 解锁 tree；若释放时发现取消，unlockEnableTree 会先回滚本轮。
+        unlockEnableTree();
 
         // 使能成功并且没有取消，即最终使能成功
         return enabled && !cancelled;
@@ -238,7 +255,7 @@ public:
     [[nodiscard]] bool disable(const bool reverse = false) noexcept final
     {
         // 向下失能只能由无控制者的节点发起
-        if (reverse && isControlled())
+        if (reverse && (isControlled() || parent_ != nullptr))
             return false;
 
         // 将本节点状态置为 cancelled
@@ -273,9 +290,8 @@ public:
         if (up != nullptr)
             (void)up->disable(false);
 
-        // 如果 disable 之前是 idle，则恢复 idle，
-        // 否则之前被另外的 使能/protect/standalone 持有，由它们自己回滚状态后释放
-        // 或者被其他 disable 持有，由 disable 自己释放
+        // 只有本次 disable 从 Idle 取得了取消标记，才由 disable 自身恢复为 Idle；
+        // 原本由使能轮或状态转移持有的节点保持 Disabling，由被打断的函数回滚后释放。
         if (held)
             enable_state_.finishDisable();
 
@@ -302,9 +318,11 @@ public:
                                                     State::Standalone,
                                                     std::memory_order_relaxed);
         }
-
         // 通过 bool unlock() 判断是否被 disable 打断
-        return result && enable_state_.unlock();
+        if (enable_state_.unlock())
+            return result;
+        enable_state_.finishDisable();
+        return false;
     }
 
     [[nodiscard]] bool protect() noexcept final
@@ -326,7 +344,10 @@ public:
                 selfDisable(); // 失能先落地：撤销刚提交的保护行为
         }
 
-        return result && enable_state_.unlock();
+        if (enable_state_.unlock())
+            return result;
+        enable_state_.finishDisable();
+        return false;
     }
 
 private:
@@ -356,6 +377,9 @@ private:
 
             // 已经使能的节点：本轮只借用，不重建其子树
             enabled_before_last_ = true;
+            if (controller == nullptr)
+                return true;
+
             if (!acquireControllerWithoutCheckingState(controller))
                 return false;
 
@@ -473,7 +497,8 @@ private:
             {
                 for (std::size_t j = i; j-- > 0;)
                     children_[j]->unlockTree();
-                enable_state_.unlock();
+                if (!enable_state_.unlock())
+                    enable_state_.finishDisable();
                 return false;
             }
         }
@@ -490,12 +515,24 @@ private:
                 return true;
         return false;
     }
-
+    /// 仅释放节点锁；用于 lockTree() 失败回滚，不执行事务状态回滚。
     void unlockTree() noexcept final
     {
-        enable_state_.unlock();
+        if (!enable_state_.unlock())
+            enable_state_.finishDisable();
         for (std::size_t i = 0; i < N; ++i)
             children_[i]->unlockTree();
+    }
+
+    void unlockEnableTree() noexcept final
+    {
+        if (!enable_state_.unlock())
+        {
+            rollbackLastEnablement();
+            enable_state_.finishDisable();
+        }
+        for (std::size_t i = 0; i < N; ++i)
+            children_[i]->unlockEnableTree();
     }
 
     void idleTree() noexcept final
@@ -513,9 +550,9 @@ private:
             if (children_[i]->parent_ == this)
                 children_[i]->idleTree();
 
-        // 如果在失能之前没有在使能或者转换状态，释放为 idle
+        // 如果本次 idleTree 取得了取消声明，则在整棵树完成失能后释放它。
         if (held)
-            enable_state_.unlock();
+            enable_state_.finishDisable();
     }
 
     void releaseController(ControllerNode* controller) noexcept final
@@ -541,9 +578,8 @@ private:
      * 节点锁：由使能事务与节点范围内的生命周期变更共同使用。
      *
      * Idle -> Active 表示使能轮或状态转移（standalone()/protect()）持有本节点；
-     * Idle -> Disabling 表示失能体取得并临时持有本节点。
-     * 持有点被置为 Disabling 表示“失能正在接管本节点，持有者必须在提交状态前观察到它、
-     * 放弃提交并自行释放本节点”。重复取消是幂等的。
+     * Idle -> Disabling 表示失能请求已接管本节点；若原状态为 Idle，由失能体释放，若原状态为
+     * Active，则由被打断的持有者回滚后释放。重复取消不会夺取已有失能体的释放责任。
      */
     class EnableState
     {
@@ -578,25 +614,25 @@ private:
             return state_.load(std::memory_order_relaxed) == State::Disabling;
         }
 
-        /// 释放本节点
+        /// 释放正常持有；若发现 Disabling，调用者必须先完成回滚，再调用 finishDisable。
         void finishDisable() noexcept { state_.store(State::Idle, std::memory_order_release); }
 
         bool unlock() noexcept
         {
-            // lock 必须从 Active 变更过来
+            // 只释放正常持有；Disabling 标记留给被打断的持有者在回滚后释放。
             State expected = State::Active;
             return state_.compare_exchange_strong(expected,
                                                   State::Idle,
-                                                  std::memory_order_acquire,
-                                                  std::memory_order_relaxed);
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire);
         }
 
         /**
          * 请求失能接管本节点在途的使能或状态转移。
          *
-         * 返回 true 表示本节点原为空闲、已由本次调用临时持有（调用者负责 unlock()）；返回
-         * false 表示本节点原有持有者，它已被置为 Disabling，并会在提交状态前观察到它、放弃
-         * 提交并自行释放本节点。两种返回值下标记都是 Disabling，因此取消不会只发不收。
+         * 返回 true 表示本节点原为空闲，本次失能取得并负责释放取消标记；返回 false 表示本节点
+         * 原本由使能轮或状态转移持有，或已经由其他失能体接管。前一种情况下，被打断的持有者
+         * 必须回滚后调用 finishDisable()；后一种情况下由已有失能体负责释放。
          */
         [[nodiscard]] bool cancel() noexcept
         {
