@@ -376,9 +376,10 @@ private:
                 return false;
 
             // 已经使能的节点：本轮只借用，不重建其子树
-            enabled_before_last_ = true;
             if (controller == nullptr)
+            {
                 return true;
+            }
 
             if (!acquireControllerWithoutCheckingState(controller))
                 return false;
@@ -394,8 +395,6 @@ private:
             state_.store(State::Controlled, std::memory_order_relaxed);
             return true;
         }
-
-        enabled_before_last_ = false;
 
         // 先向下传递使能关系
         for (std::size_t i = 0; i < N; ++i)
@@ -440,9 +439,9 @@ private:
 
     void rollbackLastEnablement() noexcept final
     {
-        if (!enabled_before_last_)
+        if (!last_enable_state_)
         {
-            // 本轮新使能的节点：关闭自身并继续向下回滚；已被失能取消的节点保持 Disabled
+            // 本轮开始时未使能：关闭本轮新使能，并只向下处理本轮可能访问过的节点。
             parent_ = nullptr;
             if (state() != State::Disabled)
             {
@@ -451,11 +450,13 @@ private:
             }
 
             for (std::size_t j = N; j-- > 0;)
-                children_[j]->rollbackLastEnablement();
+                if (children_[j]->parent_ == this || !children_[j]->lastEnableState() ||
+                    children_[j]->state() == State::Disabled)
+                    children_[j]->rollbackLastEnablement();
             return;
         }
 
-        // 本轮借用的既有使能节点：本轮已被失能取消时，借用的节点也必须保持失能
+        // 本轮开始时已使能的根节点没有需要释放的控制边；失能接管时只需保持 Disabled。
         if (enable_state_.disabling())
         {
             parent_ = nullptr;
@@ -467,7 +468,7 @@ private:
             return;
         }
 
-        // 未取消：控制边仍属于本轮时才释放它，节点保留自己原有的使能
+        // 未取得本轮控制边，或这是一个已使能的根节点：不改变既有使能状态。
         if (state() != State::Controlled || parent_ == nullptr)
             return;
 
@@ -490,6 +491,7 @@ private:
     {
         if (!enable_state_.lock())
             return false;
+        last_enable_state_ = isEnabled();
 
         for (std::size_t i = 0; i < N; ++i)
         {
@@ -644,8 +646,8 @@ private:
         std::atomic<State> state_{ State::Idle };
     } enable_state_;
 
-    /// 本轮使能开始时本节点是否已经使能；只对本轮访问过的节点有效。
-    bool enabled_before_last_{ false };
+    /// 本轮开始前节点是否已使能；lockTree() 每轮都会刷新，避免使用过期回滚状态。
+    bool last_enable_state_{ false };
 };
 
 }; // namespace core::control
