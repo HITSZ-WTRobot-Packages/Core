@@ -2,7 +2,7 @@
 
 ## IController
 
-`Core::IController` defines the lifecycle shared by every layer of a hierarchical control chain. The public C++ namespace is `core::control`. It has no hardware, RTOS, or driver dependency.
+`Core::IController` defines the lifecycle shared by every layer of a hierarchical control chain. The public C++ namespace is `core::control`. It uses `libs::Concurrency` for nonblocking node locks and has no hardware, RTOS, or driver dependency.
 
 `IController<N>` holds `N` non-owning candidate child references; `IController<>` is a leaf. The references describe possible control links, not active ownership: an edge exists only while `enable()` enables the child and still owns its control.
 
@@ -13,52 +13,93 @@
 | `Standalone` | accepted | Enabled without an owner. |
 | `Controlled` | rejected | Its control is owned by `currentController()`. |
 
-`currentController()` is non-null exactly in `Controlled`, and a disabled node owns no children. The candidate references must form an acyclic graph and stay alive for the whole lifetime of their users.
+Outside an in-progress lifecycle transaction, `currentController()` is non-null exactly in `Controlled`, and a disabled node owns no children. The candidate references must form an acyclic graph and stay alive for the whole lifetime of their users.
 
 ### Lifecycle
 
 `enable()` enables the node and its candidate subtree:
 
-- already enabled nodes return `true` immediately and are not traversed again;
-- children are processed in array order; the node then runs `selfEnable()` and `selfProtect()` before committing `Controlled` (with an owner) or `Protected` (as a root);
-- an already enabled child that is not `Standalone` is only borrowed: it keeps its existing descendants, and a failed round only releases the edge acquired by that round;
+- every call first locks its complete candidate subtree, never its ancestors; already enabled nodes then
+  return `true` without rebuilding ownership; contention anywhere in that subtree returns `false`;
+- children are processed in array order; the node then runs `selfEnable()` and `selfProtect()` before
+  committing `Controlled` (with an owner) or `Protected` (as a root);
+- an already enabled child that is not `Standalone` is only borrowed: it keeps its existing descendants,
+  and a failed round only releases the edge acquired by that round;
 - `Standalone` children are rejected, never taken over;
-- the round is transactional: `selfEnable()` failure, an ownership conflict, a `Standalone` child, or a cancellation rolls back every change of the round. Nodes the round enabled are closed again; nodes it borrowed only lose the edge it acquired;
-- `false` means the round failed, was cancelled, or the tree was already locked by another lifecycle operation. Nothing of that round is left applied, and callers may retry.
+- the round is transactional: `selfEnable()` failure, an ownership conflict, a `Standalone` child, or
+  lock contention rolls back every change of the round. Nodes the round enabled are closed again; nodes
+  it borrowed only lose the edge it acquired;
+- `false` means the round failed or the tree was already locked by another lifecycle operation. Nothing
+  of that round is left applied, and callers may retry.
 
-`disable(false)` disables the node itself, releases its directly owned children (they stay enabled and become protected roots), and then disables the controlling chain above it: each ancestor loses the children that do not belong to the chain the same way.
+Both disable directions first try-lock the entire containing candidate tree. The receiver and its active
+`parent_` chain are locked first to stabilize the root, then the remaining candidate subtrees at every
+level are locked. Inactive candidate references participate in locking too, but are not disabled.
 
-`disable(true)` (`disableTree()`) requires an owner-free node. It cancels the in-flight enables of the nodes it tears down and then disables the whole active subtree, parent before children. Candidate references that are not active edges are neither cancelled nor disabled.
+`disable(false)` disables the receiver and each ancestor in the active chain, releasing direct child
+ownership while leaving every released child enabled as a protected root with its descendants unchanged.
 
-`standalone()` moves an owner-free `Protected` node to `Standalone` and is idempotent; `protect()` moves `Standalone` back to `Protected`, applies `selfProtect()`, and is not idempotent.
+`disable(true)` (`disableTree()`) requires an owner-free node; a controlled receiver returns `false`.
+After the complete candidate tree is locked, it disables only the active ownership subtree, parent before
+children. Candidate references that are not active edges remain unchanged.
 
-### Disable priority
+For either direction, an occupied node makes the preflight return `false`; every lock acquired by that
+attempt is released and no hook, state write, parent change, or control-edge release occurs. The operation
+does not wait for or cancel the competing enable, `standalone()`, or `protect()`; callers can retry after
+the competing operation completes.
 
-Every node carries a three-state lock (`Idle` / `Enabling` / `Cancelled`) that is both the enable round's ownership mark and its cancellation mark:
+`standalone()` moves an owner-free `Protected` node to `Standalone` and is idempotent; `protect()` moves
+`Standalone` back to `Protected` and applies `selfProtect()`. Both are node-scoped lifecycle mutations:
+they take the node's lock and are refused with `false` while another lifecycle operation holds that node.
 
-- a round locks its complete candidate subtree up front, self first, then advances top-down. The marks are only released at the very end, after the round has decided: while it still owns them it evaluates `cancelledTree()` and, when a node was cancelled, runs the rollback. `enable()` returns `true` only if the traversal committed and no node was cancelled; otherwise the round is rolled back even though parts of it had already committed. Because the decision and the rollback happen inside the marked window, another context can neither lock nor be clobbered on any node of that tree in between;
-- `disable()` never waits for a round: it cancels the node's own in-flight mark (and, along the chain it tears down or in the subtree it tears down, the marks of those nodes) and then performs the disable. A cancelled round cannot commit anything new after the mark is observed;
-- boundary rule: a disable that happens **before** a node's lock is taken is ordered before that node's participation in the round, so the round may still enable it. A disable that lands **after** the lock was taken and **before** the round's decision point (`cancelledTree()`) cancels the round. One that lands after the decision point — including inside `unlockTree()`'s release sweep — is ordered after the round: its own propagation stands and the node stays `Disabled`, but the round may already have reported success, and a concurrent `enable()` on the same tree can be refused as contended (retryable);
-- guarantee is about the final state: the node that was disabled stays `Disabled` — even if the round had borrowed it — nodes the round newly enabled are closed, and borrowed nodes keep their own enablement. Since `enable()` is not executed inside a critical section, a node whose `selfEnable()` is already running can briefly switch its hardware back on before the cancellation is observed and corrected.
+### Disable locking
 
-### Concurrency and hooks
+Every node carries an `AtomicFlagLock`, held by an enable round, a permission transition, or a disable
+preflight. All lifecycle operations use the same nonblocking try-lock rule: a failed acquisition returns
+`false` and never waits or takes over the existing owner. There is no per-node acquisition-list field:
+each recursive frame tracks its successfully locked child prefix. `disable()` keeps the locked root in
+a local pointer, then unlocks through immutable candidate references after teardown, even though
+`parent_` has changed. No dynamic allocation or RTOS mutex is needed; recursion uses stack proportional
+to candidate depth, not a stack array of all acquired nodes.
 
-- Lifecycle mutations of one node are serialized by its lock; there is no global gate, mutex, spin-wait, or interrupt masking. Independent trees do not contend with each other except through shared candidate nodes.
-- `state()` and `currentController()` are intentionally unsynchronized: read them while lifecycle operations are quiescent or with external synchronization. Business `update()`/`setTarget()` operations are not serialized with the hooks either.
-- `selfEnable()`, `selfDisable()`, and `selfProtect()` run inside the propagation path: they must be short, non-blocking, ISR-usable, and nonthrowing, and must not re-enter the lifecycle API or propagate ownership.
-- A failed `selfEnable()` must clean up its own partial work; the framework calls `selfDisable()` only for successful enables.
-- `selfDisable()` must be safe to call repeatedly and on a node that never observed the enable, because a disable may interrupt an enable in flight.
-- Every `IController<N>` specialization shares the same `ControllerNode`; a shared candidate reached through two paths in one round is rejected cleanly (`enable()` returns `false`, nothing is applied, no lock is left behind).
+- enable locks only its complete candidate subtree self first, including idempotent calls, and releases
+  the whole transaction range after commit or rollback;
+- disable preflights the whole tree for either direction before running any teardown. The tree remains
+  locked throughout teardown, so state and ownership writes are performed by the holder;
+- a failed preflight recursively releases only successfully locked child prefixes and, for disable,
+  already locked ancestor ranges, without unlocking the failed child or any other operation's locks;
+  the entire graph is unchanged, and retry is possible after the competing operation completes;
+- the root is found through active `parent_` edges, not candidate references; locking then covers every
+  candidate descendant from that root, including inactive references and sibling descendants;
+- only the mutation direction differs: `reverse=false` follows active edges upward and releases direct
+  child ownership; `reverse=true` follows active edges downward from an owner-free receiver.
+- a candidate reached twice through different paths in one attempt is rejected in either direction,
+  with all acquired locks released. This is a candidate-topology conflict, not transient contention;
+  retrying the same graph cannot resolve it.
 
 ### Verification
 
-The header is a header-only `C++17` interface with no host dependency, so it was verified with throwaway host harnesses (not committed) plus an `arm-none-eabi-g++` parse:
+The header is a header-only C++17 interface with no host dependency. Verification uses throwaway host
+harnesses plus compile sweeps because no permanent lifecycle test target is committed in this package.
 
-- lifecycle harness: 133 assertions covering basic enable/release/borrow behavior, failure rollback, ownership conflicts, `Standalone` rejection, shared candidates, re-entrant `enable()`, and disable injection from inside `selfEnable()`/`selfDisable()` for in-flight rounds (`g++ -std=c++17 -Wall -Wextra -Werror -O2`, also under `-fsanitize=address,undefined` and with `clang++`);
-- precedence harness: the two interleavings in which a second context performs a whole lifecycle call while a cancelled round is being rolled back. It asserts the contract (a call that was refused applies nothing; a call that returned `true` is never revoked) and fails 3 of 16 assertions against the previous revision, which decided the round's success only after releasing every mark;
-- threaded detector: two threads, one repeatedly calling `enable()`, one racing `disable()`/`enable()` on a node of that tree. Counting only enables that returned `true` with a fresh `selfEnable()` and were later found disabled, the previous revision lost about one in seven million; the current one lost 0 of 467 million, and both a 200 000-cancel stress run and a 240/1200-scenario injection sweep reported 0 invariant violations and no leaked locks (a full round and teardown after each loop);
-- release-window race: a 2048-node tree with one thread running `enable()`/`disableTree()` rounds and another calling `disable(false)` on the child that the release sweep touches last, over 230 million disables: 0 invariant violations, 0 leaked marks, and a full round plus teardown still succeeding afterwards;
-- `arm-none-eabi-g++ -std=c++17 -mcpu=cortex-m4 -mthumb -fno-exceptions -fno-rtti -Wall -Wextra -Werror=return-type -fsyntax-only` on a translation unit that instantiates concrete controller trees.
+- lifecycle harness: leaf enable/disable, upstream release preserving enabled child subtrees, full active
+  subtree disable, controlled-node rejection, inactive-candidate preservation, self-enable failure rollback,
+  and repeated enable/disable cycles;
+- range-lock harness: occupied receiver, ancestor, direct child, and descendant cases all return `false`
+  with no hook/state/edge side effect; a preflight that acquired earlier nodes releases those locks before
+  returning; retry succeeds after the competing operation releases its node;
+- deterministic threaded scenarios: a paused lifecycle hook makes competing operations return `false`
+  only when their lock ranges overlap; retries succeed after the competing operation releases its locks;
+- recursive-rollback scenarios: a busy late candidate descendant leaves earlier sibling subtrees usable,
+  repeated failed attempts never release the busy node, and successful teardown can be followed by
+  re-enabling the same tree after its active parent links were cleared;
+- compile sweep over translation units instantiating concrete leaf and multi-child trees with
+  `g++ -std=c++17 -Wall -Wextra -Werror -Wshadow -Wconversion`, `clang++ -std=c++17 -Wall -Wextra -Werror`,
+  and, when available, `arm-none-eabi-g++ -std=c++17 -mcpu=cortex-m4 -mthumb -fno-exceptions -fno-rtti
+  -Wall -Wextra -Werror -fsyntax-only`.
+
+The harnesses emulate ISR/task preemption with coordinated threads, without reentering lifecycle APIs
+from hooks. Real failure rates on a target RTOS are not measured.
 
 A hierarchy can therefore be assembled from the same base:
 
