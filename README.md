@@ -15,6 +15,11 @@
 
 Outside an in-progress lifecycle transaction, `currentController()` is non-null exactly in `Controlled`, and a disabled node owns no children. The candidate references must form an acyclic graph and stay alive for the whole lifetime of their users.
 
+`currentController()` performs a lock-free atomic read and returns a point-in-time ownership snapshot. A
+concurrent lifecycle transaction may make that snapshot represent either side of the transition; it does
+not form a coherent pair with a separate `state()` call and does not extend the controller's lifetime.
+Every node must therefore outlive all lifecycle operations and concurrent accessor reads.
+
 ### Lifecycle
 
 `enable()` enables the node and its candidate subtree:

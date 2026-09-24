@@ -107,7 +107,16 @@ public:
     [[nodiscard]] bool isProtected() const noexcept { return state() == State::Protected; }
     [[nodiscard]] bool isControlled() const noexcept { return state() == State::Controlled; }
 
-    [[nodiscard]] ControllerNode* currentController() const noexcept { return parent_; }
+    /**
+     * 返回当前控制者的线程安全瞬时快照。
+     *
+     * 与生命周期事务并发调用时，结果可能表示事务前或提交后的控制关系，不保证与另一次独立
+     * state() 调用构成一致快照，也不延长返回对象的生命周期。
+     */
+    [[nodiscard]] ControllerNode* currentController() const noexcept
+    {
+        return parent_.load(std::memory_order_acquire);
+    }
 
 protected:
     /**
@@ -217,10 +226,12 @@ private:
 private:
     template <std::size_t> friend class IController;
 
-    std::atomic<State> state_{ State::Disabled };
+    static_assert(std::atomic<ControllerNode*>::is_always_lock_free,
+                  "ControllerNode ownership pointer must be lock-free");
 
-    ControllerNode* parent_{ nullptr };
-    AtomicFlagLock  lock_flag_;
+    std::atomic<State>           state_{ State::Disabled };
+    std::atomic<ControllerNode*> parent_{ nullptr };
+    AtomicFlagLock               lock_flag_;
 };
 
 template <std::size_t N = 0> class IController : public ControllerNode
@@ -281,7 +292,7 @@ public:
             return false;
 
         // 持有自身锁后检查控制关系；预锁失败前不执行任何生命周期改动。
-        if (reverse && parent_ != nullptr)
+        if (reverse && parent_.load(std::memory_order_relaxed) != nullptr)
         {
             lock_flag_.unlock();
             return false;
@@ -344,10 +355,10 @@ private:
     bool acquireControllerWithoutCheckingState(ControllerNode* controller) noexcept
     {
         // 只接受无主的节点；已被其他控制器持有（或已被本轮持有）都视为冲突
-        if (parent_ != nullptr)
+        if (parent_.load(std::memory_order_relaxed) != nullptr)
             return false;
 
-        parent_ = controller;
+        parent_.store(controller, std::memory_order_release);
         return true;
     }
 
@@ -392,7 +403,7 @@ private:
         selfProtect();
         if (controller != nullptr)
         {
-            parent_ = controller;
+            parent_.store(controller, std::memory_order_release);
             state_.store(State::Controlled, std::memory_order_relaxed);
         }
         else
@@ -407,7 +418,7 @@ private:
         if (!last_enable_state_)
         {
             // 本轮开始时未使能：关闭本轮新使能，并只向下处理本轮可能访问过的节点。
-            parent_ = nullptr;
+            parent_.store(nullptr, std::memory_order_release);
             if (state() != State::Disabled)
             {
                 selfDisable();
@@ -415,18 +426,18 @@ private:
             }
 
             for (std::size_t j = N; j-- > 0;)
-                if (children_[j]->parent_ == this || !children_[j]->lastEnableState() ||
-                    children_[j]->state() == State::Disabled)
+                if (children_[j]->parent_.load(std::memory_order_relaxed) == this ||
+                    !children_[j]->lastEnableState() || children_[j]->state() == State::Disabled)
                     children_[j]->rollbackLastEnablement();
             return;
         }
 
         // 未取得本轮控制边，或这是一个已使能的根节点：不改变既有使能状态。
-        if (state() != State::Controlled || parent_ == nullptr)
+        if (state() != State::Controlled || parent_.load(std::memory_order_relaxed) == nullptr)
             return;
 
         selfProtect();
-        parent_ = nullptr;
+        parent_.store(nullptr, std::memory_order_release);
 
         state_.store(State::Protected, std::memory_order_relaxed);
     }
@@ -461,13 +472,14 @@ private:
     bool lockDisableUpstream(ControllerNode* lockedChild, ControllerNode*& root) noexcept final
     {
         // 先稳定整条控制链，避免向上寻找根节点时 parent_ 被其他事务改写。
-        if (parent_ != nullptr)
+        ControllerNode* const parent = parent_.load(std::memory_order_relaxed);
+        if (parent != nullptr)
         {
-            if (!parent_->lock_flag_.lock())
+            if (!parent->lock_flag_.lock())
                 return false;
-            if (!parent_->lockDisableUpstream(this, root))
+            if (!parent->lockDisableUpstream(this, root))
             {
-                parent_->lock_flag_.unlock();
+                parent->lock_flag_.unlock();
                 return false;
             }
         }
@@ -486,8 +498,8 @@ private:
                 for (std::size_t j = i; j-- > 0;)
                     if (children_[j] != lockedChild)
                         children_[j]->unlockTree();
-                if (parent_ != nullptr)
-                    parent_->unlockDisableUpstream(this);
+                if (parent != nullptr)
+                    parent->unlockDisableUpstream(this);
                 return false;
             }
         }
@@ -500,25 +512,27 @@ private:
         for (std::size_t i = N; i-- > 0;)
             if (children_[i] != lockedChild)
                 children_[i]->unlockTree();
-        if (parent_ != nullptr)
-            parent_->unlockDisableUpstream(this);
+
+        ControllerNode* const parent = parent_.load(std::memory_order_relaxed);
+        if (parent != nullptr)
+            parent->unlockDisableUpstream(this);
         lock_flag_.unlock();
     }
 
     void disableTreeLocked() noexcept final
     {
-        parent_ = nullptr;
+        parent_.store(nullptr, std::memory_order_release);
         selfDisable();
         state_.store(State::Disabled, std::memory_order_relaxed);
         for (auto& child : children_)
-            if (child->parent_ == this)
+            if (child->parent_.load(std::memory_order_relaxed) == this)
                 child->disableTreeLocked();
     }
 
     void disableUpstreamLocked() noexcept final
     {
-        const auto up = parent_;
-        parent_       = nullptr;
+        ControllerNode* const up = parent_.load(std::memory_order_relaxed);
+        parent_.store(nullptr, std::memory_order_release);
         selfDisable();
         state_.store(State::Disabled, std::memory_order_relaxed);
         for (auto& child : children_)
@@ -530,11 +544,11 @@ private:
 
     void releaseControllerWithoutCheckState(ControllerNode* controller) noexcept final
     {
-        if (parent_ != controller)
+        if (parent_.load(std::memory_order_relaxed) != controller)
             return;
 
         selfProtect();
-        parent_ = nullptr;
+        parent_.store(nullptr, std::memory_order_release);
         state_.store(State::Protected, std::memory_order_relaxed);
     }
 
